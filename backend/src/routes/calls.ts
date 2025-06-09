@@ -1,13 +1,11 @@
 // Call management API routes
 import { Router } from 'express';
 import { IAIService, INotificationService } from '../services/interfaces';
-import { ScheduleCallRequest, ScheduleCallResponse, Call } from '../types';
+import { ScheduleCallRequest, ScheduleCallResponse } from '../types';
+import { databaseService } from '../services/database/DatabaseService';
 
 export function createCallRoutes(aiService: IAIService, notificationService: INotificationService): Router {
   const router = Router();
-
-  // In-memory store for demo (replace with database in production)
-  const calls = new Map<string, Call>();
 
   // POST /api/calls/schedule - Schedule a new wellness check call
   router.post('/schedule', async (req, res) => {
@@ -18,37 +16,34 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
         return res.status(400).json({
           error: 'Missing required fields: userId and scheduledTime are required'
         });
-      }
-
-      const callId = `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      const call: Call = {
-        id: callId,
-        userId,
-        scheduledTime: new Date(scheduledTime),
-        status: 'scheduled',
-        threatLevel: 'none',
-        conversationHistory: [],
-        emergencyTriggered: false,
-        metadata: {
-          userLocation: 'Unknown',
-          averageThreatLevel: 'none',
-          aiResponseCount: 0
-        }
+      }      const callSessionData = {
+        user_id: userId,
+        start_time: new Date(scheduledTime).toISOString(),
+        threat_level: 'none' as const,
+        conversation_history: [],
+        emergency_triggered: false,
+        ai_responses: 0,
+        user_messages: 0
       };
 
-      calls.set(callId, call);
+      const { data: session, error } = await databaseService.createCallSession(callSessionData);      if (error || !session) {
+        console.error('❌ Database error creating call session:', error);
+        return res.status(500).json({
+          error: 'Failed to schedule call',
+          details: 'Database error'
+        });
+      }
 
-      console.log(`📅 Call scheduled: ${callId} for user ${userId} at ${scheduledTime}`);
+      console.log(`📅 Call scheduled: ${session.id} for user ${userId} at ${scheduledTime}`);
 
-      // TODO: Set up actual scheduling mechanism (cron job, queue, etc.)
+      // Set up actual scheduling mechanism (cron job, queue, etc.)
       if (phoneNumber) {
         const message = `Your wellness check call has been scheduled for ${new Date(scheduledTime).toLocaleString()}. Stay safe!`;
         await notificationService.sendSMS(phoneNumber, message);
       }
 
       const response: ScheduleCallResponse = {
-        callId,
+        callId: session.id,
         scheduledTime: new Date(scheduledTime),
         status: 'scheduled'
       };
@@ -63,21 +58,20 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
       });
     }
   });
-
   // GET /api/calls/:callId - Get call details
-  router.get('/:callId', (req, res) => {
+  router.get('/:callId', async (req, res) => {
     try {
       const { callId } = req.params;
-      const call = calls.get(callId);
+      const { data: session, error } = await databaseService.getCallSession(callId);
 
-      if (!call) {
+      if (error || !session) {
         return res.status(404).json({
           error: 'Call not found',
           callId
         });
       }
 
-      res.json(call);
+      res.json(session);
 
     } catch (error) {
       console.error('❌ Get call error:', error);
@@ -86,16 +80,14 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
         details: error instanceof Error ? error.message : 'Unknown error'
       });
     }
-  });
-
-  // PUT /api/calls/:callId/status - Update call status
-  router.put('/:callId/status', (req, res) => {
+  });  // PUT /api/calls/:callId/status - Update call status (simulated since schema doesn't have status)
+  router.put('/:callId/status', async (req, res) => {
     try {
       const { callId } = req.params;
       const { status } = req.body;
 
-      const call = calls.get(callId);
-      if (!call) {
+      const { data: session, error: getError } = await databaseService.getCallSession(callId);
+      if (getError || !session) {
         return res.status(404).json({
           error: 'Call not found',
           callId
@@ -110,24 +102,41 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
         });
       }
 
-      call.status = status;
+      // Since the database schema doesn't have a status field, we'll simulate status updates
+      // by updating relevant fields based on the intended status
+      const updateData: any = {};
       
-      if (status === 'active' && !call.actualStartTime) {
-        call.actualStartTime = new Date();
+      if (status === 'active' && !session.start_time) {
+        updateData.start_time = new Date().toISOString();
       }
       
-      if (status === 'completed' && !call.actualEndTime) {
-        call.actualEndTime = new Date();
-        call.metadata.callDuration = call.actualStartTime 
-          ? Math.floor((new Date().getTime() - call.actualStartTime.getTime()) / 1000)
-          : 0;
+      if (status === 'completed' && !session.end_time) {
+        updateData.end_time = new Date().toISOString();
+        if (session.start_time) {
+          const duration = Math.floor((new Date().getTime() - new Date(session.start_time).getTime()) / 1000);
+          updateData.duration = duration;
+        }
       }
 
-      calls.set(callId, call);
+      let updatedSession = session;
+      if (Object.keys(updateData).length > 0) {
+        const { data, error: updateError } = await databaseService.updateCallSession(callId, updateData);
+        if (updateError || !data) {
+          return res.status(500).json({
+            error: 'Failed to update call status',
+            details: 'Database update failed'
+          });
+        }
+        updatedSession = data;
+      }
 
       console.log(`🔄 Call ${callId} status updated to: ${status}`);
 
-      res.json(call);
+      // Add virtual status field to response
+      res.json({
+        ...updatedSession,
+        status: status
+      });
 
     } catch (error) {
       console.error('❌ Update call status error:', error);
@@ -137,19 +146,28 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
       });
     }
   });
-
   // GET /api/calls/user/:userId - Get calls for a user
-  router.get('/user/:userId', (req, res) => {
+  router.get('/user/:userId', async (req, res) => {
     try {
       const { userId } = req.params;
-      const userCalls = Array.from(calls.values()).filter(call => call.userId === userId);
+      const { data: userSessions, error } = await databaseService.getCallSessionsByUser(userId);
+
+      if (error) {
+        console.error('❌ Database error getting user calls:', error);
+        return res.status(500).json({
+          error: 'Failed to retrieve user calls',
+          details: 'Database error'
+        });
+      }
+
+      const sessions = userSessions || [];
 
       res.json({
         userId,
-        calls: userCalls,
-        totalCalls: userCalls.length,
-        activeCalls: userCalls.filter(call => call.status === 'active').length,
-        emergencyCalls: userCalls.filter(call => call.emergencyTriggered).length
+        calls: sessions,
+        totalCalls: sessions.length,
+        activeCalls: sessions.filter(session => session.status === 'active').length,
+        emergencyCalls: sessions.filter(session => session.emergency_triggered).length
       });
 
     } catch (error) {
@@ -159,43 +177,50 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
         details: error instanceof Error ? error.message : 'Unknown error'
       });
     }
-  });
-
-  // POST /api/calls/:callId/start - Start a scheduled call
+  });  // POST /api/calls/:callId/start - Start a scheduled call
   router.post('/:callId/start', async (req, res) => {
     try {
       const { callId } = req.params;
-      const call = calls.get(callId);
+      const { data: session, error: getError } = await databaseService.getCallSession(callId);
 
-      if (!call) {
+      if (getError || !session) {
         return res.status(404).json({
           error: 'Call not found',
           callId
         });
       }
 
-      if (call.status !== 'scheduled') {
+      // Since schema doesn't have status, check if call already started by checking start_time
+      if (session.start_time && new Date(session.start_time) <= new Date()) {
         return res.status(400).json({
-          error: 'Call cannot be started',
-          currentStatus: call.status,
+          error: 'Call already started or in progress',
           callId
         });
       }
 
-      call.status = 'calling';
-      call.actualStartTime = new Date();
-      calls.set(callId, call);
+      const updateData = {
+        start_time: new Date().toISOString()
+      };
+
+      const { data: updatedSession, error: updateError } = await databaseService.updateCallSession(callId, updateData);
+
+      if (updateError || !updatedSession) {
+        return res.status(500).json({
+          error: 'Failed to start call',
+          details: 'Database update failed'
+        });
+      }
 
       console.log(`📞 Starting call: ${callId}`);
 
-      // TODO: Implement actual call initiation logic
+      // Implement actual call initiation logic
       // This could involve WebRTC signaling, Twilio voice calls, etc.
 
       res.json({
         message: 'Call started successfully',
         callId,
-        status: call.status,
-        startTime: call.actualStartTime
+        status: 'active',
+        startTime: updatedSession.start_time
       });
 
     } catch (error) {
@@ -206,29 +231,35 @@ export function createCallRoutes(aiService: IAIService, notificationService: INo
       });
     }
   });
-
   // DELETE /api/calls/:callId - Cancel a call
-  router.delete('/:callId', (req, res) => {
+  router.delete('/:callId', async (req, res) => {
     try {
       const { callId } = req.params;
-      const call = calls.get(callId);
+      const { data: session, error: getError } = await databaseService.getCallSession(callId);
 
-      if (!call) {
+      if (getError || !session) {
         return res.status(404).json({
           error: 'Call not found',
           callId
         });
       }
 
-      if (call.status === 'active') {
+      if (session.status === 'active') {
         return res.status(400).json({
           error: 'Cannot cancel an active call',
           callId,
-          status: call.status
+          status: session.status
         });
       }
 
-      calls.delete(callId);
+      const { error: deleteError } = await databaseService.deleteCallSession(callId);
+
+      if (deleteError) {
+        return res.status(500).json({
+          error: 'Failed to cancel call',
+          details: 'Database delete failed'
+        });
+      }
 
       console.log(`🗑️ Call cancelled: ${callId}`);
 

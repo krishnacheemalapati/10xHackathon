@@ -2,9 +2,11 @@
 import { Router, Request, Response } from 'express';
 import { IAIService, IVisionService } from '../services/interfaces';
 import { ChatRequest, ChatResponse, VideoFrameAnalysisRequest, VideoFrameAnalysisResponse } from '../types';
+import { DatabaseService } from '../services/database/DatabaseService';
 
 export function createChatRoutes(aiService: IAIService, visionService: IVisionService): Router {
   const router = Router();
+  const dbService = DatabaseService.getInstance();
 
   // POST /api/chat/message - Handle chat message with optional video frame
   router.post('/message', async (req: Request, res: Response) => {
@@ -17,7 +19,13 @@ export function createChatRoutes(aiService: IAIService, visionService: IVisionSe
         });
       }
 
-      console.log(`💬 Processing chat message for call ${callId}: ${message.substring(0, 50)}...`);
+      console.log(`💬 Processing chat message for call ${callId}: ${message.substring(0, 50)}...`);      // Get call session from database
+      const { data: callSession, error: callError } = await dbService.getCallSession(callId);
+      if (callError || !callSession) {
+        return res.status(404).json({
+          error: `Call session ${callId} not found`
+        });
+      }
 
       // Analyze video frame if provided
       let visualThreatAssessment = null;
@@ -30,13 +38,15 @@ export function createChatRoutes(aiService: IAIService, visionService: IVisionSe
         } catch (error) {
           console.error('❌ Video frame analysis failed:', error);
         }
-      }      // Generate AI response with threat assessment
+      }
+
+      // Generate AI response with threat assessment
       const aiResponse = await aiService.generateResponse(message, {
         callId,
-        userId: 'demo-user', // TODO: Get from session
-        conversationHistory: [], // TODO: Get from database  
+        userId: callSession.user_id,
+        conversationHistory: [], // TODO: Implement chat history storage
         currentThreatLevel: 'none',
-        callDuration: 300
+        callDuration: callSession.duration ?? 300
       });
 
       console.log(`🤖 AI response generated`);
@@ -106,7 +116,6 @@ export function createChatRoutes(aiService: IAIService, visionService: IVisionSe
       });
     }
   });
-
   // POST /api/chat/summarize - Summarize conversation
   router.post('/summarize', async (req: Request, res: Response) => {
     try {
@@ -118,8 +127,16 @@ export function createChatRoutes(aiService: IAIService, visionService: IVisionSe
         });
       }
 
-      // Get conversation history from database (placeholder for now)
-      const conversationHistory: any[] = []; // Placeholder
+      // Get call session from database
+      const { data: callSession, error: callError } = await dbService.getCallSession(callId);
+      if (callError || !callSession) {
+        return res.status(404).json({
+          error: `Call session ${callId} not found`
+        });
+      }
+
+      // Get conversation history from call session
+      const conversationHistory = callSession.conversation_history || [];
 
       const summary = await aiService.summarizeConversation(conversationHistory);
 

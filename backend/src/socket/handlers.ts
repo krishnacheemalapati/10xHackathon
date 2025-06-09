@@ -2,6 +2,7 @@
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { IAIService, IVisionService, INotificationService } from '../services/interfaces';
 import { ChatMessage, ThreatAssessment } from '../types';
+import { DatabaseService } from '../services/database/DatabaseService';
 
 interface SocketServices {
   aiService: IAIService;
@@ -19,22 +20,21 @@ interface CallSession {
   conversationHistory: ChatMessage[];
 }
 
-// Active call sessions
-const activeSessions = new Map<string, CallSession>();
+// In-memory socket session tracking (for active connections)
+const socketSessions = new Map<string, CallSession>();
 
 export function setupSocketHandlers(io: SocketIOServer, services: SocketServices): void {
+  const dbService = DatabaseService.getInstance();
   io.on('connection', (socket: Socket) => {
-    console.log(`🔌 Client connected: ${socket.id}`);
-
-    // Join a call session
-    socket.on('join-call', (data: { callId: string; userId: string }) => {
+    console.log(`🔌 Client connected: ${socket.id}`);    // Join a call session
+    socket.on('join-call', async (data: { callId: string; userId: string }) => {
       try {
         const { callId, userId } = data;
         
         console.log(`📞 User ${userId} joining call ${callId} via socket ${socket.id}`);
         
-        // Create or update session
-        const session: CallSession = {
+        // Create socket session for tracking connection
+        const socketSession: CallSession = {
           callId,
           userId,
           socketId: socket.id,
@@ -44,8 +44,24 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
           conversationHistory: []
         };
         
-        activeSessions.set(callId, session);
+        socketSessions.set(callId, socketSession);
         socket.join(callId);
+
+        // Create or get existing call session in database
+        const { data: existingSession } = await dbService.getCallSession(callId);
+          if (!existingSession) {
+          // Create new call session in database
+          const callSessionData = {
+            id: callId,
+            user_id: userId,
+            scheduled_time: new Date().toISOString(),
+            start_time: new Date().toISOString(),
+            duration: 0,
+            conversation_history: []
+          };
+
+          await dbService.createCallSession(callSessionData);
+        }
         
         // Notify client of successful join
         socket.emit('call-joined', {
@@ -83,34 +99,31 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
         console.error('❌ Join call error:', error);
         socket.emit('error', { message: 'Failed to join call' });
       }
-    });
-
-    // Handle chat messages
+    });    // Handle chat messages
     socket.on('chat-message', async (data: { callId: string; message: string; videoFrame?: string }) => {
       try {
         const { callId, message, videoFrame } = data;
-        const session = activeSessions.get(callId);
+        const socketSession = socketSessions.get(callId);
         
-        if (!session) {
+        if (!socketSession) {
           socket.emit('error', { message: 'Call session not found' });
           return;
         }
 
         console.log(`💬 Chat message in call ${callId}: "${message}"`);
         
-        // Update session activity
-        session.lastActivity = new Date();
-        
-        // Create user message
+        // Update socket session activity
+        socketSession.lastActivity = new Date();
+          // Create user message
         const userMessage: ChatMessage = {
-          id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
           callId,
           role: 'user',
           content: message,
           timestamp: new Date()
         };
         
-        session.conversationHistory.push(userMessage);
+        socketSession.conversationHistory.push(userMessage);
 
         // Analyze threat from text
         const textThreatAssessment = await services.aiService.assessThreatFromText(message);
@@ -128,31 +141,40 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
         const visualLevel = visualThreatAssessment ? threatLevels.indexOf(visualThreatAssessment.level) : -1;
         const overallThreatLevel = threatLevels[Math.max(textLevel, visualLevel)] || 'none';
         
-        session.threatLevel = overallThreatLevel;
+        socketSession.threatLevel = overallThreatLevel;
         userMessage.threatAssessment = textThreatAssessment;
 
         // Generate AI response
         const context = {
           callId,
-          userId: session.userId,
-          conversationHistory: session.conversationHistory,
+          userId: socketSession.userId,
+          conversationHistory: socketSession.conversationHistory,
           currentThreatLevel: overallThreatLevel,
-          callDuration: Math.floor((new Date().getTime() - session.startTime.getTime()) / 1000)
+          callDuration: Math.floor((new Date().getTime() - socketSession.startTime.getTime()) / 1000)
         };
 
         const aiResponse = await services.aiService.generateResponse(message, context);
-        
-        // Create AI message
+          // Create AI message
         const aiMessage: ChatMessage = {
-          id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
           callId,
           role: 'assistant',
           content: aiResponse.message,
           timestamp: new Date()
         };
         
-        session.conversationHistory.push(aiMessage);
-        activeSessions.set(callId, session);
+        socketSession.conversationHistory.push(aiMessage);
+        socketSessions.set(callId, socketSession);
+
+        // Update conversation history in database
+        try {
+          await dbService.updateCallSession(callId, {
+            conversation_history: socketSession.conversationHistory,
+            duration: Math.floor((new Date().getTime() - socketSession.startTime.getTime()) / 1000)
+          });
+        } catch (dbError) {
+          console.error('⚠️ Failed to update conversation in database:', dbError);
+        }
 
         // Emit responses
         socket.emit('ai-message', {
@@ -175,7 +197,7 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
           // Notify other connected clients (dashboard, monitoring)
           socket.to(callId).emit('emergency-escalated', {
             callId,
-            userId: session.userId,
+            userId: socketSession.userId,
             threatLevel: overallThreatLevel,
             message: message,
             timestamp: new Date().toISOString()
@@ -186,15 +208,13 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
         console.error('❌ Chat message handling error:', error);
         socket.emit('error', { message: 'Failed to process message' });
       }
-    });
-
-    // Handle video frame analysis only
+    });    // Handle video frame analysis only
     socket.on('video-frame', async (data: { callId: string; frameData: string }) => {
       try {
         const { callId, frameData } = data;
-        const session = activeSessions.get(callId);
+        const socketSession = socketSessions.get(callId);
         
-        if (!session) {
+        if (!socketSession) {
           socket.emit('error', { message: 'Call session not found' });
           return;
         }
@@ -203,12 +223,12 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
         const threatAssessment = await services.visionService.assessSafety(frameData);
 
         // Update session if threat level increased
-        const currentThreatIndex = ['none', 'low', 'medium', 'high', 'critical'].indexOf(session.threatLevel);
+        const currentThreatIndex = ['none', 'low', 'medium', 'high', 'critical'].indexOf(socketSession.threatLevel);
         const newThreatIndex = ['none', 'low', 'medium', 'high', 'critical'].indexOf(threatAssessment.level);
         
         if (newThreatIndex > currentThreatIndex) {
-          session.threatLevel = threatAssessment.level;
-          activeSessions.set(callId, session);
+          socketSession.threatLevel = threatAssessment.level;
+          socketSessions.set(callId, socketSession);
         }
 
         socket.emit('video-analysis', {
@@ -232,26 +252,37 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
         console.error('❌ Video frame handling error:', error);
         socket.emit('error', { message: 'Failed to analyze video frame' });
       }
-    });
-
-    // Handle call end
-    socket.on('end-call', (data: { callId: string }) => {
+    });    // Handle call end
+    socket.on('end-call', async (data: { callId: string }) => {
       try {
         const { callId } = data;
-        const session = activeSessions.get(callId);
+        const socketSession = socketSessions.get(callId);
         
-        if (session) {
-          console.log(`📞 Call ${callId} ended by user ${session.userId}`);
+        if (socketSession) {
+          console.log(`📞 Call ${callId} ended by user ${socketSession.userId}`);
+          
+          const callDuration = Math.floor((new Date().getTime() - socketSession.startTime.getTime()) / 1000);
+          
+          // Update call session in database with final data
+          try {
+            await dbService.updateCallSession(callId, {
+              end_time: new Date().toISOString(),
+              duration: callDuration,
+              conversation_history: socketSession.conversationHistory
+            });
+          } catch (dbError) {
+            console.error('⚠️ Failed to update call session on end:', dbError);
+          }
           
           socket.emit('call-ended', {
             callId,
-            duration: Math.floor((new Date().getTime() - session.startTime.getTime()) / 1000),
-            messageCount: session.conversationHistory.length,
-            finalThreatLevel: session.threatLevel,
+            duration: callDuration,
+            messageCount: socketSession.conversationHistory.length,
+            finalThreatLevel: socketSession.threatLevel,
             timestamp: new Date().toISOString()
           });
 
-          activeSessions.delete(callId);
+          socketSessions.delete(callId);
         }
         
         socket.leave(callId);
@@ -260,17 +291,15 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
         console.error('❌ End call error:', error);
         socket.emit('error', { message: 'Failed to end call' });
       }
-    });
-
-    // Handle disconnect
+    });    // Handle disconnect
     socket.on('disconnect', (reason) => {
       console.log(`🔌 Client disconnected: ${socket.id} - Reason: ${reason}`);
       
       // Clean up any sessions for this socket
-      for (const [callId, session] of activeSessions.entries()) {
-        if (session.socketId === socket.id) {
+      for (const [callId, socketSession] of socketSessions.entries()) {
+        if (socketSession.socketId === socket.id) {
           console.log(`🧹 Cleaning up session for call ${callId}`);
-          activeSessions.delete(callId);
+          socketSessions.delete(callId);
         }
       }
     });
@@ -286,10 +315,10 @@ export function setupSocketHandlers(io: SocketIOServer, services: SocketServices
     const now = new Date();
     const inactiveThreshold = 30 * 60 * 1000; // 30 minutes
 
-    for (const [callId, session] of activeSessions.entries()) {
-      if (now.getTime() - session.lastActivity.getTime() > inactiveThreshold) {
+    for (const [callId, socketSession] of socketSessions.entries()) {
+      if (now.getTime() - socketSession.lastActivity.getTime() > inactiveThreshold) {
         console.log(`🧹 Cleaning up inactive session: ${callId}`);
-        activeSessions.delete(callId);
+        socketSessions.delete(callId);
       }
     }
   }, 5 * 60 * 1000); // Check every 5 minutes

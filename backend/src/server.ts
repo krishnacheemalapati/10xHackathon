@@ -15,6 +15,7 @@ import { createChatRoutes } from './routes/chat';
 import { createCallRoutes } from './routes/calls';
 import { createEmergencyRoutes } from './routes/emergency';
 import safewalkRoutes from './routes/safewalk';
+import usersRoutes from './routes/users';
 
 // Socket handlers
 import { setupSocketHandlers } from './socket/handlers';
@@ -95,25 +96,24 @@ class Server {
     console.log('🛣️  Setting up routes...');
 
     // Make io available to routes
-    this.app.locals.io = this.io;
-
-    // API routes
+    this.app.locals.io = this.io;    // API routes
     this.app.use('/api/chat', createChatRoutes(this.aiService, this.visionService));
     this.app.use('/api/calls', createCallRoutes(this.aiService, this.notificationService));
     this.app.use('/api/emergency', createEmergencyRoutes(this.notificationService));
     this.app.use('/api/safewalk', safewalkRoutes);
+    this.app.use('/api/users', usersRoutes);
 
     // Root endpoint
     this.app.get('/', (req, res) => {
       res.json({
         message: '🤖 AI Video Call Platform API',
-        version: '1.0.0',
-        endpoints: {
+        version: '1.0.0',        endpoints: {
           health: '/health',
           chat: '/api/chat',
           calls: '/api/calls',
           emergency: '/api/emergency',
-          safewalk: '/api/safewalk'
+          safewalk: '/api/safewalk',
+          users: '/api/users'
         },
         websocket: 'Available on /socket.io',
         documentation: 'See README.md for API documentation'

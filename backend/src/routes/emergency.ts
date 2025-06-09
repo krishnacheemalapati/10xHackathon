@@ -1,13 +1,12 @@
 // Emergency response API routes
 import { Router } from 'express';
 import { INotificationService } from '../services/interfaces';
-import { EmergencyIncident, EmergencyContact } from '../types';
+import { EmergencyContact } from '../types';
+import { DatabaseService } from '../services/database/DatabaseService';
 
 export function createEmergencyRoutes(notificationService: INotificationService): Router {
   const router = Router();
-
-  // In-memory store for demo (replace with database in production)
-  const incidents = new Map<string, EmergencyIncident>();
+  const dbService = DatabaseService.getInstance();
 
   // POST /api/emergency/escalate - Escalate an incident to emergency services
   router.post('/escalate', async (req, res) => {
@@ -18,42 +17,42 @@ export function createEmergencyRoutes(notificationService: INotificationService)
         return res.status(400).json({
           error: 'Missing required fields: callId, userId, threatLevel, and description are required'
         });
-      }
-
-      const incidentId = `incident_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      // Create emergency incident
-      const incident: EmergencyIncident = {
-        id: incidentId,
-        callId,
-        userId,
-        timestamp: new Date(),
-        threatLevel,
-        description,
-        contactedAuthorities: [],
-        resolved: false,
-        notes: ''
+      }      // Create emergency incident data
+      const incidentData = {
+        user_id: userId,
+        session_id: callId, // Using callId as session_id since they're related
+        type: 'emergency_escalation',
+        severity: threatLevel as 'low' | 'medium' | 'high' | 'critical',
+        status: 'active' as const,
+        location: location ?? 'Unknown location',
+        notes: description
       };
 
-      // Get appropriate emergency contacts
-      const emergencyContacts = await getEmergencyContacts(threatLevel, location || 'Unknown location');
+      // Create incident in database
+      const { data: incident, error } = await dbService.createEmergencyIncident(incidentData);
+
+      if (error || !incident) {
+        console.error('❌ Database error creating incident:', error);
+        return res.status(500).json({
+          error: 'Failed to create emergency incident',
+          details: 'Database error'
+        });
+      }      // Get appropriate emergency contacts
+      const emergencyContacts = await getEmergencyContacts(threatLevel, location ?? 'Unknown location');
       
-      console.log(`🚨 EMERGENCY ESCALATION - Incident ${incidentId}`);
+      console.log(`🚨 EMERGENCY ESCALATION - Incident ${incident.id}`);
       console.log(`   Threat Level: ${threatLevel}`);
       console.log(`   Description: ${description}`);
       console.log(`   Contacting ${emergencyContacts.length} authorities`);
 
       // Contact emergency services
       await notificationService.notifyEmergencyContacts(emergencyContacts, incident);
-      
-      incident.contactedAuthorities = emergencyContacts;
-      incidents.set(incidentId, incident);
 
       res.status(201).json({
-        incidentId,
+        incidentId: incident.id,
         message: 'Emergency escalation initiated',
         contactedAuthorities: emergencyContacts.length,
-        timestamp: incident.timestamp
+        timestamp: incident.created_at
       });
 
     } catch (error) {
@@ -64,17 +63,26 @@ export function createEmergencyRoutes(notificationService: INotificationService)
       });
     }
   });
-
   // GET /api/emergency/incidents - Get all incidents
-  router.get('/incidents', (req, res) => {
+  router.get('/incidents', async (req, res) => {
     try {
-      const allIncidents = Array.from(incidents.values());
+      const { data: allIncidents, error } = await dbService.getEmergencyIncidents();
       
+      if (error) {
+        console.error('❌ Database error getting incidents:', error);
+        return res.status(500).json({
+          error: 'Failed to retrieve incidents',
+          details: 'Database error'
+        });
+      }
+
+      const incidents = allIncidents || [];
+
       res.json({
-        incidents: allIncidents,
-        totalIncidents: allIncidents.length,
-        activeIncidents: allIncidents.filter(i => !i.resolved).length,
-        resolvedIncidents: allIncidents.filter(i => i.resolved).length
+        incidents,
+        totalIncidents: incidents.length,
+        activeIncidents: incidents.filter((i: any) => i.status === 'active').length,
+        resolvedIncidents: incidents.filter((i: any) => i.status === 'resolved').length
       });
 
     } catch (error) {
@@ -87,12 +95,12 @@ export function createEmergencyRoutes(notificationService: INotificationService)
   });
 
   // GET /api/emergency/incidents/:incidentId - Get specific incident
-  router.get('/incidents/:incidentId', (req, res) => {
+  router.get('/incidents/:incidentId', async (req, res) => {
     try {
       const { incidentId } = req.params;
-      const incident = incidents.get(incidentId);
+      const { data: incident, error } = await dbService.getEmergencyIncident(incidentId);
 
-      if (!incident) {
+      if (error || !incident) {
         return res.status(404).json({
           error: 'Incident not found',
           incidentId
@@ -109,24 +117,24 @@ export function createEmergencyRoutes(notificationService: INotificationService)
       });
     }
   });
-
   // PUT /api/emergency/incidents/:incidentId/resolve - Mark incident as resolved
-  router.put('/incidents/:incidentId/resolve', (req, res) => {
+  router.put('/incidents/:incidentId/resolve', async (req, res) => {
     try {
       const { incidentId } = req.params;
       const { notes } = req.body;
-      
-      const incident = incidents.get(incidentId);
-      if (!incident) {
+        // Update incident status to resolved
+      const { data: incident, error } = await dbService.updateEmergencyIncident(incidentId, {
+        status: 'resolved',
+        notes: notes ?? 'Incident resolved',
+        resolution_time: Date.now()
+      });
+
+      if (error || !incident) {
         return res.status(404).json({
-          error: 'Incident not found',
+          error: 'Incident not found or failed to update',
           incidentId
         });
       }
-
-      incident.resolved = true;
-      incident.notes = notes || 'Incident resolved';
-      incidents.set(incidentId, incident);
 
       console.log(`✅ Incident resolved: ${incidentId}`);
 
